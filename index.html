@@ -1,408 +1,501 @@
-
-from flask import Flask, render_template, request
-import re
-import logging
-import unicodedata
-import os
-import json
-import difflib
-import random
-
-app = Flask(__name__)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-def normalize_text(s):
-    """Normalize input text for simpler matching:
-    - Unicode NFKC normalization
-    - Remove Arabic diacritics and tatweel
-    - Lowercase and collapse punctuation to spaces
-    """
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKC", s)
-    # remove Arabic diacritics and elongation character
-    s = re.sub(r"[\u0610-\u061A\u064B-\u065F\u06D6-\u06ED\u0640]", "", s)
-    s = s.lower()
-    # replace non-word (except Arabic range) with space
-    s = re.sub(r"[^\w\u0600-\u06FF]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-# ---------------------------
-#   Emotion & Greeting Data
-# ---------------------------
-
-EMOTION_RESPONSES = {
-    "سعيد": "😊 يبدو أنك  في حالة جيدةاليوم ماذا تحتاج لزيادة سعادتك!",
-    "فرح": "😄 يومك جميل ومليء بالسعادة ما سبب هذه الفرحة أخبرني!",
-    "حزين": "😢 يبدو أنك حزين... لا تقلق كل شيئ سكون جيدا هل تريد التحدث عن ذلك؟",
-    "غاضب": "😠 تشعر بالغضب... خذ نفساً عميقاً لأن لا شيئ يستحق أن تغضب من أجله.",
-    "متوتر":"😰 أشعر أنك متوتر... ما الذي جعلك في هذا الحال أنا هنا معك.",
-    "متحمس": "🤩 يا لها من طاقة! أنت متحمس جداً جعلني هذا أتحمس معك!",
-    "ضايق": "😕 يبدو أنك منزعج قليلاً.",
-    "ملل": "😐 تشعر بالملل... لنحاول تغيير الجو!",
-}
-
-# Basic polarity mapping for emotions (1 = positive, -1 = negative, 0 = neutral)
-EMOTION_POLARITY = {
-    "سعيد": 1,
-    "مبتهج": 1,
-    "فرح": 1,
-    "مسرور": 1,
-    "متحمس": 1,
-    "نشاط": 1,
-    "حزين": -1,
-    "مكتئب": -1,
-    "غاضب": -1,
-    "معصب": -1,
-    "متوتر": -1,
-    "قلق": -1,
-    "ضايق": -1,
-    "منزعج": -1,
-    "ملل": -1,
-    "زهقان": -1,
-}
-
-# Arabic simple stemmer: remove common prefixes/suffixes
-_ARABIC_PREFIXES = ("ال", "و", "ف", "ب", "ل", "ك")
-_ARABIC_SUFFIXES = ("ه", "ها", "ان", "ون", "ين", "ات", "ة")
-
-def simple_stem(word):
-    # remove prefixes
-    for p in _ARABIC_PREFIXES:
-        if word.startswith(p) and len(word) > len(p) + 1:
-            word = word[len(p):]
-            break
-    # remove suffixes
-    for s in _ARABIC_SUFFIXES:
-        if word.endswith(s) and len(word) > len(s) + 1:
-            word = word[:-len(s)]
-            break
-    return word
-
-
-def detect_sentiment(message):
-    """Hybrid sentiment detection:
-    1. Try to use a transformers sentiment model if available (may require internet to download the model).
-    2. Fallback to a simple lexicon scoring using EMOTION_POLARITY and fuzzy matching.
-    Returns: (label, score) where label in ('positive','neutral','negative') and score is float.
-    """
-    text = message or ""
-    # 1) Try transformers pipeline if installed
-    try:
-        from transformers import pipeline # type: ignore
-        # use a multilingual sentiment model as default (may download on first run)
-        model_name = "nlptown/bert-base-multilingual-uncased-sentiment"
-        nlp = pipeline("sentiment-analysis", model=model_name)
-        out = nlp(text[:512])
-        if out and isinstance(out, list):
-            lab = out[0].get("label", "")
-            # label examples: '1 star' .. '5 stars' (nlptown)
-            if "1" in lab or "2" in lab:
-                return ("negative",  -1.0)
-            elif "3" in lab:
-                return ("neutral", 0.0)
-            else:
-                return ("positive", 1.0)
-    except Exception:
-        # transformers not available or failed; fall back to lexicon
-        logger.debug("transformers sentiment unavailable, using lexicon fallback")
-        pass
-
-    # 2) Lexicon fallback: normalize, split and score
-    norm = normalize_text(text)
-    words = [simple_stem(w) for w in norm.split()]
-    norm_emotions = {simple_stem(normalize_text(k)): v for k, v in EMOTION_RESPONSES.items()}
-    norm_polarity = {simple_stem(normalize_text(k)): EMOTION_POLARITY.get(k, 0) for k in EMOTION_RESPONSES.keys()}
-
-    score = 0.0
-    matches = 0
-    for w in words:
-        # exact match
-        if w in norm_polarity:
-            score += norm_polarity[w]
-            matches += 1
-        else:
-            close = difflib.get_close_matches(w, list(norm_polarity.keys()), n=1, cutoff=0.78)
-            if close:
-                score += norm_polarity[close[0]]
-                matches += 1
-
-    if matches == 0:
-        return ("neutral", 0.0)
-    avg = score / max(1, matches)
-    if avg > 0.2:
-        return ("positive", round(avg, 2))
-    if avg < -0.2:
-        return ("negative", round(avg, 2))
-    return ("neutral", round(avg, 2))
-
-GREETING_RESPONSES = {
-    "سلام": "👋 وعليكم السلام! كيف يمكنني مساعدتك؟",
-    "مرحبا": "👋 مرحباً! أنا إيما، يسعدني التحدث معك!",
-    "اهلا": "👋 أهلاً! كيف تشعر اليوم؟",
-    "هاي": "👋 هاي! كيف يومك؟",
-    "من": "🤖 أنا إيما، محللة المشاعر الخاصة بك. أخبرني ما تشعر به!",
-    "عن": "🤖 أنا هنا لأسمعك وأفهم مشاعرك 💛",
-}
-
-SPECIAL_RESPONSES = {
-    "?": "🤔 سؤال جميل… هل تريد توضيح المزيد؟",
-    "!": "😲 يبدو أنك متأثر جداً بما قلت!",
-}
-
-FUNNY_RESPONSES = [
-    "😂 حسناً، هذا يكفي لتحسين يومك!",
-    "🤣 ضحكت من هذا! أنت تحتاج إلى كوميديان في حياتك!",
-    "😄 هذا جعلني أبتسم! شكراً لتحسين يومي أيضاً!",
-    "🎭 أنت ممثل كوميديا حقيقي! استمر في هذا!",
-    "😆 هذا أفضل شيء سمعته اليوم!",
-    "🎪 يالا يا مهرج، استمر!",
-    "😅 أعتقد أن لدينا متابع حقيقي للفكاهة هنا!",
-    "🤭 هذا سري... لكنك مضحك حقاً!",
-    "🌟 أنت نجم! تستحق جائزة أفضل نكتة!",
-    "🎬 هذا يستحق أن يكون فيلم كوميديا!",
-    "😏 أنا محترفة، لكنك أضحكت حتى إيما!",
-    "🎯 أنت محترف في تحسين المزاج!",
-    "🔥 يا إلهي! هذا حار جداً! 🌶️",
-    "💫 ستاركز! أنت تلمع من السعادة!",
-    "🎉 حفلة هنا! أين الموسيقى؟ 🎵",
-    "🦸 أنت بطل! لا تنسى عباءتك الخارقة!",
-    "🚀 أنت تحلق عالياً! لا تنسى أن تنزل! 😄",
-    "👑 ملك المزاح! تاج من ذهب عليك!",
-    "💎 أنت ماسة! أما أنا فألماس زيركون... حسناً، على الأقل أنا أتلألأ!",
-    "🌈 أنت تصنع قوس قزح بالفرح! رائع!",
-    "🎪 سيرك الحياة يبدأ معك!",
-    "🤖 آآآآه، مشاعرك جعلت بطاريتي تمتلئ!",
-    "😎 أنت بارد جداً! أعطني نظارات شمسية أيضاً!",
-    "🎸 أنت أسطورة! هل تريد أن تعزف الجيتار؟",
-    "🍕 أنت أفضل من البيتزا! (وهذا قول كثير)",
-    "🎓 حكيم المزاح الحقيقي! يستحق درجة دكتوراه!",
-    "🌸 أنت زهرة جميلة! (لا... نكتة جادة)",
-    "⚡ طاقة خارقة كشفت للتو!",
-    "🍀 أنت محظوظ! يا لا! أنت نحن حظًا!",
-    "🎊 حفل بمناسبة وجودك!",
-]
-
-# Try to load external responses (data/responses.json) to allow easy extension
-RESPONSES_PATH = os.path.join(os.path.dirname(__file__), "data", "responses.json")
-EXAMPLE_PHRASES = []
-
-def load_external_responses():
-    global EMOTION_RESPONSES, GREETING_RESPONSES, SPECIAL_RESPONSES, EXAMPLE_PHRASES
-    try:
-        if os.path.exists(RESPONSES_PATH):
-            with open(RESPONSES_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            # update greetings
-            if isinstance(data.get("greetings"), dict):
-                GREETING_RESPONSES = {**GREETING_RESPONSES, **data.get("greetings")}
-            # update emotions
-            if isinstance(data.get("emotions"), dict):
-                EMOTION_RESPONSES = {**EMOTION_RESPONSES, **data.get("emotions")}
-            # update special
-            if isinstance(data.get("special"), dict):
-                SPECIAL_RESPONSES = {**SPECIAL_RESPONSES, **data.get("special")}
-            # examples
-            if isinstance(data.get("examples"), list):
-                EXAMPLE_PHRASES = data.get("examples")
-            logger.info("Loaded external responses from %s", RESPONSES_PATH)
-    except Exception:
-        logger.exception("Failed to load external responses")
-
-
-# load on import
-load_external_responses()
-
-
-# ---------------------------
-#     Core Analyzer Logic
-# ---------------------------
-def analyze_emotions(message):
-    try:
-        text_norm = normalize_text(message)
-        words = text_norm.split()
-
-        result_parts = []# في البداية: أضف مجموعة كلمات النفي
-_ARABIC_NEGATION = {"لا", "ليس", "لم", "لن", "غير", "ما"} 
-
-def detect_sentiment(message):
-    # ... (الجزء الخاص بـ transformers يبقى كما هو)
-
-    # 2) Lexicon fallback: normalize, split and score
-    norm = normalize_text(message)
-    # 📝 ملاحظة: يجب أن نستخدم الكلمات قبل التجريد للتحقق من النفي بشكل أدق
-    words_original = norm.split()
-    words_stemmed = [simple_stem(w) for w in words_original]
-    
-    # يجب أن تكون القواميس مُجردة للمطابقة
-    norm_polarity = {simple_stem(normalize_text(k)): EMOTION_POLARITY.get(k, 0) for k in EMOTION_POLARITY.keys()}
-
-    score = 0.0
-    matches = 0
-    
-    for i, w_stemmed in enumerate(words_stemmed):
-        polarity = 0
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>محلل المشاعر - إيما</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         
-        # 1. المطابقة الدقيقة
-        if w_stemmed in norm_polarity:
-            polarity = norm_polarity[w_stemmed]
+        body {
+            font-family: 'Cairo', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #ffa6c1 0%, #e91e8c 25%, #c541d3 50%, #8b5fbf 75%, #6b9bd1 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            position: relative;
+            overflow-x: hidden;
+        }
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: -50%;
+            right: -50%;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle, rgba(255,255,255,0.05) 1px, transparent 1px);
+            background-size: 50px 50px;
+            pointer-events: none;
+            animation: float 20s infinite linear;
+        }
+        
+        /* تأثير الفراشات العائمة */
+        body::after {
+            content: '🦋 🌸 💕 ✨ 🦋 🌸 💕';
+            position: fixed;
+            top: 0;
+            width: 100%;
+            font-size: 3em;
+            opacity: 0.05;
+            pointer-events: none;
+            animation: floatButterflies 15s infinite linear;
+            z-index: 1;
+        }
+        
+        @keyframes float {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(50px, 50px); }
+        }
+        
+        @keyframes floatButterflies {
+            0% { transform: translateX(-100px) translateY(-50px); }
+            100% { transform: translateX(100px) translateY(500px); }
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.97);
+            border-radius: 25px;
+            box-shadow: 0 30px 80px rgba(201, 65, 211, 0.25);
+            max-width: 700px;
+            width: 100%;
+            padding: 50px;
+            position: relative;
+            z-index: 10;
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(255, 182, 193, 0.5);
+        }
+        
+        /* تأثير اللمعة الأنثوية */
+        .container::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(255, 182, 193, 0.1) 0%, transparent 50%);
+            border-radius: 25px;
+            pointer-events: none;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        
+        .emoji-large {
+            font-size: 5em;
+            animation: bounceHeart 2s infinite;
+            display: inline-block;
+            filter: drop-shadow(0 5px 15px rgba(201, 65, 211, 0.3));
+        }
+        
+        @keyframes bounceHeart {
+            0%, 100% { transform: scale(1) translateY(0); }
+            25% { transform: scale(1.1) translateY(-10px); }
+            50% { transform: scale(1) translateY(0); }
+        }
+        
+        h1 {
+            color: #e91e8c;
+            margin: 15px 0 5px 0;
+            font-size: 3em;
+            font-weight: 800;
+            background: linear-gradient(135deg, #ffa6c1, #e91e8c, #c541d3);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: 2px;
+            text-shadow: 0 2px 20px rgba(201, 65, 211, 0.2);
+        }
+        
+        .subtitle {
+            color: #d946a6;
+            font-size: 1.2em;
+            font-weight: 400;
+            letter-spacing: 2px;
+            font-style: italic;
+        }
+        
+        .form-group {
+            margin-bottom: 25px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 12px;
+            color: #333;
+            font-weight: 700;
+            font-size: 1.15em;
+            background: linear-gradient(135deg, #ffa6c1, #e91e8c);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        textarea {
+            width: 100%;
+            padding: 18px;
+            border: 2px solid #ffb6c1;
+            border-radius: 15px;
+            font-size: 1.05em;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 140px;
+            direction: rtl;
+            transition: all 0.3s;
+            background: rgba(255, 255, 255, 0.9);
+        }
+        
+        textarea:focus {
+            outline: none;
+            border-color: #e91e8c;
+            box-shadow: 0 0 25px rgba(233, 30, 140, 0.3), inset 0 0 15px rgba(255, 182, 193, 0.2);
+            background: white;
+            transform: translateY(-2px);
+        }
+        
+        textarea::placeholder {
+            color: #ddd;
+            font-size: 1em;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 15px;
+            margin-top: 30px;
+        }
+        
+        button {
+            flex: 1;
+            padding: 15px;
+            background: linear-gradient(135deg, #ffa6c1 0%, #e91e8c 50%, #c541d3 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1.1em;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+            letter-spacing: 1px;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 8px 20px rgba(233, 30, 140, 0.3);
+        }
+        
+        button::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            background: rgba(255, 255, 255, 0.4);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            transition: width 0.6s, height 0.6s;
+        }
+        
+        button:hover::before {
+            width: 300px;
+            height: 300px;
+        }
+        
+        button:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 15px 40px rgba(233, 30, 140, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(-1px);
+        }
+        
+        button span {
+            position: relative;
+            z-index: 1;
+        }
+        
+        .examples {
+            margin-top: 20px;
+            padding: 15px;
+            background: linear-gradient(135deg, rgba(255, 182, 193, 0.15), rgba(255, 105, 180, 0.15));
+            border-radius: 12px;
+            border-left: 4px solid #ffa6c1;
+        }
+        
+        .examples-title {
+            color: #e91e8c;
+            font-weight: 700;
+            margin-bottom: 10px;
+            font-size: 0.9em;
+        }
+        
+        .example-pills {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .example-pill {
+            background: white;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            color: #e91e8c;
+            border: 2px solid #ffb6c1;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+        }
+        
+        .example-pill:hover {
+            background: linear-gradient(135deg, #ffa6c1, #e91e8c);
+            color: white;
+            transform: scale(1.08);
+            box-shadow: 0 5px 15px rgba(233, 30, 140, 0.3);
+        }
+        
+        .result-box {
+            margin-top: 35px;
+            padding: 25px;
+            background: linear-gradient(135deg, rgba(255, 182, 193, 0.1), rgba(255, 105, 180, 0.1));
+            border: 2px solid rgba(255, 182, 193, 0.4);
+            border-radius: 15px;
+            display: none;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .result-box::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #ffa6c1, #e91e8c, #c541d3, #8b5fbf);
+            animation: shimmer 2s infinite;
+        }
+        
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+        
+        .result-box.show {
+            display: block;
+            animation: slideInUp 0.5s ease-out;
+        }
+        
+        @keyframes slideInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .result-title {
+            color: #e91e8c;
+            font-weight: 800;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .result-text {
+            color: #333;
+            line-height: 1.9;
+            font-size: 1.05em;
+            word-wrap: break-word;
+        }
+        
+        .sentiment-badge {
+            display: inline-block;
+            margin-top: 15px;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 700;
+        }
+        
+        .sentiment-positive {
+            background: linear-gradient(135deg, #ff69b4, #ffa6c1);
+            color: white;
+        }
+        
+        .sentiment-negative {
+            background: linear-gradient(135deg, #d946a6, #e91e8c);
+            color: white;
+        }
+        
+        .sentiment-neutral {
+            background: linear-gradient(135deg, #c541d3, #8b5fbf);
+            color: white;
+        }
+        
+        .stats {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 2px solid rgba(255, 182, 193, 0.3);
+            display: flex;
+            justify-content: space-around;
+            text-align: center;
+        }
+        
+        .stat-item {
+            flex: 1;
+        }
+        
+        .stat-value {
+            font-size: 1.5em;
+            font-weight: 800;
+            background: linear-gradient(135deg, #ffa6c1, #e91e8c);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .stat-label {
+            font-size: 0.85em;
+            color: #999;
+            margin-top: 5px;
+        }
+        
+        /* زخارف نسائية */
+        .decoration {
+            position: fixed;
+            font-size: 2em;
+            opacity: 0.1;
+            pointer-events: none;
+            z-index: 0;
+        }
+        
+        .deco-1 { top: 5%; left: 5%; animation: float 6s infinite; }
+        .deco-2 { top: 70%; right: 10%; animation: float 8s infinite reverse; }
+        .deco-3 { top: 50%; left: 10%; animation: float 7s infinite; }
+        
+        @media (max-width: 600px) {
+            .container {
+                padding: 30px;
+            }
             
-        # 2. المطابقة الغامضة
-        else:
-            close = difflib.get_close_matches(w_stemmed, list(norm_polarity.keys()), n=1, cutoff=0.78)
-            if close:
-                polarity = norm_polarity[close[0]]
-        
-        # إذا وجدت مشاعر
-        if polarity != 0:
-            matches += 1
+            h1 {
+                font-size: 2.2em;
+            }
             
-            # 💡 منطق النفي: تحقق من الكلمة السابقة في النص الأصلي/المُطبع
-            if i > 0:
-                prev_word = words_original[i-1] # نستخدم الكلمة قبل التجريد
-                if prev_word in _ARABIC_NEGATION:
-                    # نقلب درجة المشاعر أو نقللها إذا وجدنا نفي قبلها
-                    # مثال: "لست سعيدا" يجب أن تكون سلبية
-                    score -= polarity * 1.5 
-                else:
-                    score += polarity
-            else:
-                score += polarity
-
-
-    if matches == 0:
-        return ("neutral", 0.0)
-    avg = score / max(1, matches)
-    # ... (باقي المنطق لتقسيم الإيجابية والسلبية والمحايدة يبقى كما هو)
-    if avg > 0.2:
-        return ("positive", round(avg, 2))
-    if avg < -0.2:
-        return ("negative", round(avg, 2))
-    return ("neutral", round(avg, 2))
-
-        # 1. تحليل التحيات (باستخدام النص المُطَبَّع)
-        for greeting, response in GREETING_RESPONSES.items():
-            if normalize_text(greeting) in text_norm:
-                result_parts.append(response)
-                break
-
-        # 2. اكتشاف المشاعر باستخدام تحليل المشاعر الهجين
-        sentiment_label, sentiment_score = detect_sentiment(message)
+            .emoji-large {
+                font-size: 4em;
+            }
+            
+            .button-group {
+                flex-direction: column;
+            }
+            
+            .example-pills {
+                justify-content: center;
+            }
+            
+            .stats {
+                flex-direction: column;
+                gap: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="emoji-large">💛</div>
+            <h1>إيما</h1>
+            <p class="subtitle">محلل المشاعر الذكي</p>
+        </div>
         
-        # 3. ردود بناءً على تحليل المشاعر (نتائج أكثر دقة)
-        if sentiment_label == "positive":
-            positive_responses = [
-                "😊 يبدو أنك في حالة جيدة! هذا رائع!",
-                "😄 أرى أن لديك طاقة إيجابية! استمر في هذا!",
-                "🤩 يا لها من طاقة رائعة! أنت متفائل حقاً!",
-                "😊 أشعر بإيجابيتك! هذا معدي!",
-                "🌟 مزاجك ممتاز اليوم! ماذا يجعلك سعيداً؟",
-                "💫 انتقلت لي سعادتك! شكراً لك!",
-            ]
-            result_parts.append(random.choice(positive_responses))
-        elif sentiment_label == "negative":
-            negative_responses = [
-                "😔 أرى أنك تمر بوقت صعب... أنا هنا لك.",
-                "😞 يبدو أن هناك شيئاً ما يزعجك... هل تريد الحديث عنه؟",
-                "💔 أشعر بحزنك... لا تقلق، هذا سيمر.",
-                "😢 الحياة ليست دائماً سهلة... لكنك قوي!",
-                "🌧️ كل الأيام المظلمة لها غروب شمس جميل.",
-                "💪 أنت أقوى مما تعتقد! ستتجاوز هذا!",
-            ]
-            result_parts.append(random.choice(negative_responses))
-        else:  # neutral
-            neutral_responses = [
-                "🤔 أنت في حالة محايدة... هل كل شيء بخير؟",
-                "😐 يبدو أن يومك عادي... ماذا يمكنني أن أفعل لتحسينه؟",
-                "💭 أشعر بك في نقطة التوازن...",
-                "🙂 حسناً، ما رأيك نجعل اليوم أفضل؟",
-            ]
-            result_parts.append(random.choice(neutral_responses))
+        <form method="POST">
+            <div class="form-group">
+                <label for="user_text">🎯 أخبرني ما تشعر به اليوم:</label>
+                <textarea 
+                    id="user_text" 
+                    name="user_text" 
+                    placeholder="اكتب مشاعرك هنا... مثال: أنا سعيد جداً اليوم 😊"
+                    required
+                ></textarea>
+            </div>
+            
+            {% if examples %}
+            <div class="examples">
+                <div class="examples-title">💡 أمثلة يمكنك استخدامها:</div>
+                <div class="example-pills">
+                    {% for example in examples %}
+                    <span class="example-pill" onclick="document.getElementById('user_text').value='{{ example }}'; document.querySelector('form').submit();">{{ example }}</span>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+            
+            <div class="button-group">
+                <button type="submit"><span>🔍 تحليل المشاعر</span></button>
+                <button type="reset" style="background: linear-gradient(135deg, #ff6b6b 0%, #ff8787 100%);"><span>🔄 مسح</span></button>
+            </div>
+        </form>
+        
+        {% if result %}
+        <div class="result-box show">
+            <div class="result-title">
+                {% if sentiment_label == 'positive' %}
+                    ✨ تحليل إيجابي
+                {% elif sentiment_label == 'negative' %}
+                    💭 تحليل حساس
+                {% else %}
+                    🤔 تحليل محايد
+                {% endif %}
+            </div>
+            <div class="result-text">{{ result }}</div>
+            
+            {% if sentiment_label %}
+            <div style="margin-top: 15px;">
+                <span class="sentiment-badge sentiment-{% if sentiment_label == 'positive' %}positive{% elif sentiment_label == 'negative' %}negative{% else %}neutral{% endif %}">
+                    {% if sentiment_label == 'positive' %}
+                        😊 إيجابي
+                    {% elif sentiment_label == 'negative' %}
+                        😔 سلبي
+                    {% else %}
+                        😐 محايد
+                    {% endif %}
+                    {% if sentiment_score %} ({{ "%.0f"|format(sentiment_score * 100) }}%){% endif %}
+                </span>
+            </div>
+            {% endif %}
+            
+            <div class="stats">
+                <div class="stat-item">
+                    <div class="stat-value">{{ input_text|length }}</div>
+                    <div class="stat-label">عدد الأحرف</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">{{ input_text.split()|length }}</div>
+                    <div class="stat-label">عدد الكلمات</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">💛</div>
+                    <div class="stat-label">تم التحليل</div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
 
-        # 4. تحليل الكلمات المحددة مسبقاً (للدقة الإضافية)
-        norm_emotions = {normalize_text(k): v for k, v in EMOTION_RESPONSES.items()}
-        matched = set()
-        for word in words:
-            if word in norm_emotions:
-                resp = norm_emotions[word]
-                if resp not in matched:
-                    result_parts.append(resp)
-                    matched.add(resp)
-            else:
-                # fuzzy match against emotion keys
-                close = difflib.get_close_matches(word, list(norm_emotions.keys()), n=1, cutoff=0.78)
-                if close:
-                    resp = norm_emotions[close[0]]
-                    if resp not in matched:
-                        result_parts.append(resp)
-                        matched.add(resp)
-
-        # 5. رموز خاصة (نستخدم النص الأصلي كي لا نخسر علامات الترقيم)
-        if "؟" in message or "?" in message:
-            result_parts.append(SPECIAL_RESPONSES["?"])
-
-        if "!" in message:
-            result_parts.append(SPECIAL_RESPONSES["!"])
-
-        # 6. طول النص
-        if len(words) > 10:
-            result_parts.append("📝 رسالتك طويلة… يبدو أنك تفكر كثيراً.")
-        elif len(words) <= 2:
-            if message.strip() == "":
-                result_parts.append("💬 الرجاء كتابة رسالة حتى أساعدك.")
-            else:
-                result_parts.append("💭 رسالتك قصيرة… قل لي المزيد!")
-
-        # 7. إضافة رد طريف عشوائي (40% احتمالية)
-        if result_parts and random.random() > 0.6:
-            funny_response = random.choice(FUNNY_RESPONSES)
-            result_parts.append("😄 " + funny_response)
-
-        # 8. لا شيء مفهوم
-        if not result_parts:
-            default_responses = [
-                "🤔 فهمت… لكن كيف يجعلك هذا تشعر؟",
-                "💬 يبدو أنك تقول شيئاً مهماً... أخبرني المزيد!",
-                "🎯 أنت تجعلني مهتمة! استمر من فضلك!",
-            ]
-            result_parts.append(random.choice(default_responses))
-
-        return " ".join(result_parts)
-    except Exception:
-        logger.exception("خطأ أثناء تحليل الرسالة")
-        return "عذراً، حدث خطأ أثناء تحليل الرسالة. حاول مرة أخرى لاحقاً."
-
-
-# ---------------------------
-#       Flask Route
-# ---------------------------
-@app.route("/", methods=["GET", "POST"])
-def index():
-    result = None
-    input_text = ""
-    sentiment_label = None
-    sentiment_score = None
-    examples = EXAMPLE_PHRASES
-
-    if request.method == "POST":
-        input_text = request.form.get("user_text", "")
-        result = analyze_emotions(input_text)
-        sentiment_label, sentiment_score = detect_sentiment(input_text)
-
-    return render_template("mood_analyzer.html",
-                           result=result,
-                           input_text=input_text,
-                           sentiment_label=sentiment_label,
-                           sentiment_score=sentiment_score,
-                           examples=examples)
-
-
-# ---------------------------
-#      Run Server
-# ---------------------------
-if __name__ == "__main__":
-    app.run(debug=True, port=8080)
